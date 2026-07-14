@@ -129,13 +129,25 @@ async function unitTests() {
     eq(JSON.parse(up.body).stream, false, "openai stream=false");
   });
 
-  await test("buildUpstream: openai 流式", () => {
+  await test("buildUpstream: openai 流式自动注入 stream_options.include_usage", () => {
     const up = buildUpstream(
       { provider: "openai", api_key: "k", base_url: "", model_map: "{}" },
       { model: "gpt-4o", stream: true }
     );
     eq(up.isStream, true, "openai isStream");
-    eq(JSON.parse(up.body).stream, true, "openai body.stream=true");
+    const b = JSON.parse(up.body);
+    eq(b.stream, true, "openai body.stream=true");
+    eq(b.stream_options.include_usage, true, "自动注入 include_usage");
+  });
+
+  await test("buildUpstream: openai 流式不覆盖客户端已有 stream_options", () => {
+    const up = buildUpstream(
+      { provider: "openai", api_key: "k", base_url: "", model_map: "{}" },
+      { model: "gpt-4o", stream: true, stream_options: { include_usage: false, other: 1 } }
+    );
+    const b = JSON.parse(up.body);
+    eq(b.stream_options.include_usage, true, "仍强制 include_usage=true");
+    eq(b.stream_options.other, 1, "保留客户端其它 stream_options");
   });
 
   await test("buildUpstream: anthropic 拆分 system 消息", () => {

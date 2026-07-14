@@ -125,7 +125,7 @@ Claude Code / OpenCode 等若要接 Anthropic 原生，也可在后台加一个 
 ## 已知边界（MVP）
 
 - 功能聚焦"中转 + 分发 + 用量"，**未实现**原版 sub2api 的：支付系统、可视化调度策略、OAuth 登录导入、并发精细控制、iframe 外部集成。
-- 流式用量统计依赖上游在末个 chunk 回传 `usage`（OpenAI 需客户端带 `stream_options.include_usage=true`；Anthropic/Gemini 由网关从事件里抓取）。
+- 流式用量统计：网关对 **OpenAI 流式**会自动注入 `stream_options.include_usage=true`（不覆盖客户端已传的其它 stream_options），因此无需客户端特殊设置即可统计 token；Anthropic / Gemini 由网关从事件里抓取 usage。
 - 单 Worker 的 CPU / 响应时长有上限（免费版约 10s CPU），超大模型长对话建议开 Workers Paid 提额。
 - 不要把管理令牌和 Key 写进客户端日志；Key 泄露≈上游账号暴露。
 

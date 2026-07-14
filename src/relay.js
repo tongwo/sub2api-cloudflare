@@ -44,6 +44,11 @@ export function buildUpstream(acct, body) {
   const base = (acct.base_url && acct.base_url.trim()) || DEFAULT_BASE[acct.provider];
 
   if (acct.provider === "openai") {
+    const out = { ...body, model, stream: isStream };
+    // 流式时自动要求上游回传 usage（与客户端已传的 stream_options 合并，不覆盖）
+    if (isStream) {
+      out.stream_options = { ...(body.stream_options || {}), include_usage: true };
+    }
     return {
       provider: "openai",
       isStream,
@@ -52,7 +57,7 @@ export function buildUpstream(acct, body) {
         "content-type": "application/json",
         authorization: `Bearer ${acct.api_key}`,
       },
-      body: JSON.stringify({ ...body, model, stream: isStream }),
+      body: JSON.stringify(out),
     };
   }
 
