@@ -226,6 +226,22 @@ async function integrationTests(mock) {
     eq(j.service, "sub2api-cf", "service 名");
   });
 
+  await test("裸域名 / 302 跳转到 /admin", async () => {
+    const { env, ctx } = setup();
+    const r = await worker.fetch(new Request("https://x/"), env, ctx);
+    eq(r.status, 302, "status 302");
+    eq(new URL(r.headers.get("location")).pathname, "/admin", "Location 指向 /admin");
+  });
+
+  await test("/admin 返回后台 HTML", async () => {
+    const { env, ctx } = setup();
+    const r = await worker.fetch(new Request("https://x/admin"), env, ctx);
+    eq(r.status, 200, "status 200");
+    const t = await r.text();
+    assert(t.includes("管理后台"), "含后台标题");
+    assert(t.includes('id="token"'), "含令牌输入框");
+  });
+
   await test("无 key 调用 /v1/chat/completions -> 401", async () => {
     const { env, ctx } = setup();
     const r = await worker.fetch(

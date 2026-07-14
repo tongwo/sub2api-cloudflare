@@ -7,8 +7,15 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    if (path === "/health" || path === "/") {
+    if (path === "/health") {
       return json({ ok: true, service: "sub2api-cf", ts: Date.now() });
+    }
+
+    // 裸域名跳转到管理后台，避免直接打开只看到 health 的 JSON
+    if (path === "/") {
+      const u = new URL(request.url);
+      u.pathname = "/admin";
+      return Response.redirect(u.toString(), 302);
     }
 
     // 管理后台页面

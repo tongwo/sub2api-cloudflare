@@ -112,6 +112,14 @@ function addKey(){
   .then(function(r){$("k_out").textContent="新 Key（请妥善保存）：\n\n"+r.key;loadKeys();loadStats();})
   .catch(function(e){alert("生成失败："+e.message);});
 }
+
+// 支持从 URL 读取令牌：/admin?token=xxx 打开即自动加载，无需手动粘贴
+(function(){
+  try {
+    var t = new URLSearchParams(location.search).get("token");
+    if (t) { $("token").value = t; reload(); }
+  } catch(e) {}
+})();
 </script>
 </body>
 </html>`;
