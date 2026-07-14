@@ -114,6 +114,14 @@ async function handleChat(request, env, ctx) {
   }
 
   // 6b) 流式：转 SSE
+  // 先确认上游状态：非 2xx 直接透传错误体，避免把错误 JSON 当 SSE 解析成空响应
+  if (upstreamResp.status !== 200) {
+    const errText = await upstreamResp.text();
+    return new Response(errText, {
+      status: upstreamResp.status,
+      headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
+    });
+  }
   const state = { model, provider: upstream.provider, usage: null };
   const translator = upstream.translator || openaiPassTranslator;
   const stream = makeOpenAIStream(upstreamResp.body, translator, state, async (st) => {

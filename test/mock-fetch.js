@@ -9,12 +9,21 @@ export function installFetchMock() {
   globalThis.fetch = async (url, opts = {}) => {
     const u = new URL(typeof url === "string" ? url : url.toString());
     const body = opts.body ? JSON.parse(opts.body) : null;
+    const auth = (opts.headers && (opts.headers.authorization || opts.headers.Authorization)) || "";
     calls.push({ url: u.toString(), host: u.host, headers: opts.headers || {}, body });
     console.log("    ↳ upstream ->", u.host, JSON.stringify(body?.model || ""));
 
+    // 坏 key：无论流式与否都返回 401 JSON（模拟上游鉴权失败）
+    if (auth.includes("bad")) {
+      return new Response(JSON.stringify({ error: { message: "invalid api key", type: "auth_error" } }), {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      });
+    }
+
     if (u.host === "api.openai.com") return mockOpenAI(body);
     if (u.host === "api.anthropic.com") return mockAnthropic(body);
-    if (u.host === "generativelanguage.googleapis.com") return mockGemini(body);
+    if (u.host === "generativelanguage.googleapis.com") return mockGemini(body, u);
     return new Response("not found", { status: 404 });
   };
 
@@ -48,27 +57,48 @@ function mockOpenAI(body) {
 }
 
 function mockAnthropic(body) {
-  // Anthropic 走 SSE，事件用 event:/data: 行
-  const sse = [
-    `event: message_start`,
-    `data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":5}}}`,
-    `event: content_block_delta`,
-    `data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}`,
-    `event: content_block_delta`,
-    `data: {"type":"content_block_delta","delta":{"type":"text_delta","text":" world"}}`,
-    `event: message_delta`,
-    `data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}`,
-    `event: message_stop`,
-    `data: {"type":"message_stop"}`,
-  ].join("\n\n");
-  return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+  if (body?.stream) {
+    const sse = [
+      `event: message_start`,
+      `data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":5}}}`,
+      `event: content_block_delta`,
+      `data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}`,
+      `event: content_block_delta`,
+      `data: {"type":"content_block_delta","delta":{"type":"text_delta","text":" world"}}`,
+      `event: message_delta`,
+      `data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}`,
+      `event: message_stop`,
+      `data: {"type":"message_stop"}`,
+    ].join("\n\n");
+    return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+  }
+  // 非流式
+  return new Response(
+    JSON.stringify({
+      content: [{ type: "text", text: "Hello world" }],
+      usage: { input_tokens: 5, output_tokens: 3 },
+      stop_reason: "end_turn",
+    }),
+    { status: 200, headers: { "content-type": "application/json" } }
+  );
 }
 
-function mockGemini(body) {
-  // Gemini 走 SSE（alt=sse），只有 data: 行
-  const sse = [
-    `data: {"candidates":[{"content":{"parts":[{"text":"Hello"}]}}]}`,
-    `data: {"candidates":[{"content":{"parts":[{"text":" world"}]}}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":3}}`,
-  ].join("\n\n");
-  return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+function mockGemini(body, u) {
+  // Gemini 的流式靠 URL 的 ?alt=sse 标识（上游 body 不含 stream 字段），故按 URL 判断
+  const isStream = u.searchParams.get("alt") === "sse";
+  if (isStream) {
+    const sse = [
+      `data: {"candidates":[{"content":{"parts":[{"text":"Hello"}]}}]}`,
+      `data: {"candidates":[{"content":{"parts":[{"text":" world"}]}}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":3}}`,
+    ].join("\n\n");
+    return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+  }
+  // 非流式
+  return new Response(
+    JSON.stringify({
+      candidates: [{ content: { parts: [{ text: "Hello world" }] } }],
+      usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 3 },
+    }),
+    { status: 200, headers: { "content-type": "application/json" } }
+  );
 }

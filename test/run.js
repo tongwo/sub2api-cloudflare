@@ -383,6 +383,124 @@ async function integrationTests(mock) {
     eq(r.status, 429, "status 429");
   });
 
+  await test("Anthropic 非流式：JSON 转换 + 用量落库", async () => {
+    const { db, env, ctx } = setup();
+    await seedAccount(db, { provider: "anthropic", name: "an", api_key: "sk-anthropic", base_url: "" });
+    const key = await seedKey(db);
+    const r = await worker.fetch(
+      new Request("https://x/v1/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer " + key, "content-type": "application/json" },
+        body: JSON.stringify({ model: "claude-3", messages: [{ role: "user", content: "hi" }] }),
+      }),
+      env,
+      ctx
+    );
+    eq(r.status, 200, "status 200");
+    const j = await r.json();
+    eq(j.choices[0].message.content, "Hello world", "内容");
+    eq(j.usage.total_tokens, 8, "usage");
+    await ctx.drain();
+    const uk = await db.prepare("SELECT used_tokens FROM user_keys WHERE key=?").bind(key).first();
+    eq(uk.used_tokens, 8, "用量落库");
+  });
+
+  await test("Gemini 非流式：JSON 转换 + 用量落库", async () => {
+    const { db, env, ctx } = setup();
+    await seedAccount(db, { provider: "gemini", name: "gm", api_key: "sk-gemini", base_url: "" });
+    const key = await seedKey(db);
+    const r = await worker.fetch(
+      new Request("https://x/v1/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer " + key, "content-type": "application/json" },
+        body: JSON.stringify({ model: "gemini-1.5", messages: [{ role: "user", content: "hi" }] }),
+      }),
+      env,
+      ctx
+    );
+    eq(r.status, 200, "status 200");
+    const j = await r.json();
+    eq(j.choices[0].message.content, "Hello world", "内容");
+    eq(j.usage.total_tokens, 8, "usage");
+    await ctx.drain();
+    const uk = await db.prepare("SELECT used_tokens FROM user_keys WHERE key=?").bind(key).first();
+    eq(uk.used_tokens, 8, "用量落库");
+  });
+
+  await test("流式上游报错：坏 key -> 401 透传（不静默空响应）", async () => {
+    const { db, env, ctx } = setup();
+    await seedAccount(db, { provider: "openai", name: "oa", api_key: "sk-bad-key", base_url: "" });
+    const key = await seedKey(db);
+    const r = await worker.fetch(
+      new Request("https://x/v1/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer " + key, "content-type": "application/json" },
+        body: JSON.stringify({ model: "gpt-4o", messages: [{ role: "user", content: "hi" }], stream: true }),
+      }),
+      env,
+      ctx
+    );
+    eq(r.status, 401, "流式坏 key 也返回 401");
+    const j = await r.json();
+    assert(j.error, "透传上游错误体");
+  });
+
+  await test("非流式上游报错：坏 key -> 401 透传", async () => {
+    const { db, env, ctx } = setup();
+    await seedAccount(db, { provider: "openai", name: "oa", api_key: "sk-bad-key", base_url: "" });
+    const key = await seedKey(db);
+    const r = await worker.fetch(
+      new Request("https://x/v1/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer " + key, "content-type": "application/json" },
+        body: JSON.stringify({ model: "gpt-4o", messages: [{ role: "user", content: "hi" }] }),
+      }),
+      env,
+      ctx
+    );
+    eq(r.status, 401, "非流式坏 key 401");
+    const j = await r.json();
+    assert(j.error, "透传上游错误体");
+  });
+
+  await test("全部账号禁用 -> 503", async () => {
+    const { db, env, ctx } = setup();
+    await db
+      .prepare("INSERT INTO accounts (provider,name,api_key,base_url,model_map,weight,enabled,created_at) VALUES (?,?,?,?,?,?,?,?)")
+      .bind("openai", "off", "sk-x", "", "{}", 1, 0, Date.now())
+      .run();
+    const key = await seedKey(db);
+    const r = await worker.fetch(
+      new Request("https://x/v1/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer " + key, "content-type": "application/json" },
+        body: JSON.stringify({ model: "gpt-4o", messages: [{ role: "user", content: "hi" }] }),
+      }),
+      env,
+      ctx
+    );
+    eq(r.status, 503, "无可用账号 503");
+  });
+
+  await test("模型映射：请求 gpt-4 转发为 gpt-4o", async () => {
+    const { db, env, ctx } = setup();
+    await seedAccount(db, { provider: "openai", name: "oa", api_key: "sk-openai", base_url: "", model_map: { "gpt-4": "gpt-4o" } });
+    const key = await seedKey(db);
+    mock.calls.length = 0;
+    const r = await worker.fetch(
+      new Request("https://x/v1/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer " + key, "content-type": "application/json" },
+        body: JSON.stringify({ model: "gpt-4", messages: [{ role: "user", content: "hi" }] }),
+      }),
+      env,
+      ctx
+    );
+    await r.json();
+    const call = mock.calls.find((c) => c.host === "api.openai.com");
+    eq(call.body.model, "gpt-4o", "上游收到映射后的模型名");
+  });
+
   await test("LRU 轮询：两个账号交替被选中", async () => {
     const { db, env, ctx } = setup();
     await seedAccount(db, { provider: "openai", name: "A", api_key: "sk-A", base_url: "" });
@@ -416,7 +534,7 @@ async function integrationTests(mock) {
 // ============================================================
 //  入口
 // ============================================================
-async function main() {
+export async function runTests() {
   console.log("\x1b[1mSub2API-CF 测试\x1b[0m");
   const mock = installFetchMock();
   try {
@@ -429,9 +547,13 @@ async function main() {
   if (failures.length) {
     console.log("\x1b[31m失败项:\x1b[0m");
     failures.forEach((f) => console.log("  -", f));
-    process.exit(1);
+    return false;
   }
   console.log("\x1b[32m全部通过 ✅\x1b[0m");
+  return true;
 }
 
-main();
+// 直接运行：node --experimental-sqlite test/run.js
+if (import.meta.url === `file://${process.argv[1]}`) {
+  runTests().then((ok) => process.exit(ok ? 0 : 1));
+}
