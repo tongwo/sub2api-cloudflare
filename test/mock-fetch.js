@@ -1,0 +1,74 @@
+// test/mock-fetch.js
+// 本地替身上游：拦截 globalThis.fetch，模拟 OpenAI / Anthropic / Gemini 的响应。
+// 关键：SSE 响应以「整段字符串」作为 body 返回（与真实上游行为一致），
+// 这样被 handler 用 ReadableStream 重新流式化时不会触发 undici 的死锁。
+export function installFetchMock() {
+  const calls = [];
+  const orig = globalThis.fetch;
+
+  globalThis.fetch = async (url, opts = {}) => {
+    const u = new URL(typeof url === "string" ? url : url.toString());
+    const body = opts.body ? JSON.parse(opts.body) : null;
+    calls.push({ url: u.toString(), host: u.host, headers: opts.headers || {}, body });
+    console.log("    ↳ upstream ->", u.host, JSON.stringify(body?.model || ""));
+
+    if (u.host === "api.openai.com") return mockOpenAI(body);
+    if (u.host === "api.anthropic.com") return mockAnthropic(body);
+    if (u.host === "generativelanguage.googleapis.com") return mockGemini(body);
+    return new Response("not found", { status: 404 });
+  };
+
+  return {
+    calls,
+    restore() {
+      globalThis.fetch = orig;
+    },
+  };
+}
+
+function mockOpenAI(body) {
+  if (body?.stream) {
+    const sse = [
+      `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"},"finish_reason":null}]}`,
+      `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":" world"},"finish_reason":null}]}`,
+      `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}`,
+      `data: [DONE]`,
+    ].join("\n\n");
+    return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+  }
+  return new Response(
+    JSON.stringify({
+      id: "chatcmpl-1",
+      object: "chat.completion",
+      choices: [{ index: 0, message: { role: "assistant", content: "Hello world" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+    }),
+    { status: 200, headers: { "content-type": "application/json" } }
+  );
+}
+
+function mockAnthropic(body) {
+  // Anthropic 走 SSE，事件用 event:/data: 行
+  const sse = [
+    `event: message_start`,
+    `data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":5}}}`,
+    `event: content_block_delta`,
+    `data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}`,
+    `event: content_block_delta`,
+    `data: {"type":"content_block_delta","delta":{"type":"text_delta","text":" world"}}`,
+    `event: message_delta`,
+    `data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}`,
+    `event: message_stop`,
+    `data: {"type":"message_stop"}`,
+  ].join("\n\n");
+  return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+}
+
+function mockGemini(body) {
+  // Gemini 走 SSE（alt=sse），只有 data: 行
+  const sse = [
+    `data: {"candidates":[{"content":{"parts":[{"text":"Hello"}]}}]}`,
+    `data: {"candidates":[{"content":{"parts":[{"text":" world"}]}}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":3}}`,
+  ].join("\n\n");
+  return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+}

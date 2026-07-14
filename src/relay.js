@@ -123,7 +123,7 @@ function openAIToGemini(body) {
 
 // ---------- 各家 -> OpenAI 格式（非流式） ----------
 
-function anthropicToOpenAI(j, model) {
+export function anthropicToOpenAI(j, model) {
   const content = (j.content || []).map((c) => c.text || "").join("");
   const usage = j.usage || {};
   return {
@@ -144,7 +144,7 @@ function anthropicToOpenAI(j, model) {
   };
 }
 
-function geminiToOpenAI(j, model) {
+export function geminiToOpenAI(j, model) {
   const parts = j.candidates?.[0]?.content?.parts || [];
   const text = parts.map((p) => p.text || "").join("");
   const u = j.usageMetadata || {};
@@ -261,10 +261,12 @@ export function makeOpenAIStream(upstreamBody, translator, state, onDone) {
   const decoder = new TextDecoder();
   let buf = "";
 
-  function processChunk(controller, text) {
-    buf += text;
+  // 处理 buf 中的完整行。isFinal=false 时把可能不完整的末行留在 buf；
+  // isFinal=true（流结束）时把最后一行也一并处理，避免末尾事件丢失。
+  function consume(controller, isFinal) {
+    if (!buf) return;
     const lines = buf.split("\n");
-    buf = lines.pop();
+    if (!isFinal) buf = lines.pop() || ""; // 残行留到下次 / 收尾
     for (const raw of lines) {
       const line = raw.trim();
       if (!line) continue;
@@ -285,7 +287,7 @@ export function makeOpenAIStream(upstreamBody, translator, state, onDone) {
     async pull(controller) {
       const { done, value } = await reader.read();
       if (done) {
-        if (buf.trim()) processChunk(controller, buf);
+        consume(controller, true);
         const tail = translator.flush ? (translator.flush(state) || []) : [];
         for (const c of tail) controller.enqueue(encoder.encode("data: " + JSON.stringify(c) + "\n\n"));
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
@@ -293,7 +295,8 @@ export function makeOpenAIStream(upstreamBody, translator, state, onDone) {
         controller.close();
         return;
       }
-      processChunk(controller, decoder.decode(value, { stream: true }));
+      buf += decoder.decode(value, { stream: true });
+      consume(controller, false);
     },
   });
 }

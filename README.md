@@ -36,13 +36,18 @@ OpenAI / Anthropic / Gemini API
 
 ```
 sub2api-cf/
-├── wrangler.toml          # Workers 配置（含 D1 绑定，填入你的 database_id）
+├── wrangler.toml          # Workers 配置（含 D1 绑定 + 自定义域名）
 ├── migrations/
 │   └── 0001_init.sql      # D1 建表
 ├── src/
 │   ├── index.js            # 网关入口：鉴权 / 负载均衡 / 用量 / 管理 API
 │   ├── relay.js            # 上游协议适配（OpenAI / Anthropic / Gemini）
 │   └── admin.js           # 管理后台 HTML（Worker 直接 serve）
+├── test/
+│   ├── d1.js               # 用 node:sqlite 模拟 D1 的本地替身
+│   ├── mock-fetch.js       # 模拟 OpenAI / Anthropic / Gemini 上游
+│   └── run.js              # 端到端测试（unit + integration）
+├── package.json
 └── README.md
 ```
 
@@ -71,6 +76,17 @@ npx wrangler deploy
 ```
 
 部署完会得到一个 `https://sub2api-cf.<你的子域>.workers.dev`。
+
+## 本地测试（无需 Cloudflare）
+
+测试用 Node 内置 `node:sqlite` 模拟 D1、用 mock 拦截上游，直接调用真实的 `src/index.js` handler，跑通「鉴权 → LRU 选账号 → 协议转换 → 流式转发 → 用量落库 → 额度 → 管理 API」全链路（含 OpenAI / Anthropic / Gemini 三种流式转换）。
+
+```bash
+npm test
+# 等价于：node --experimental-sqlite test/run.js
+```
+
+需要 Node.js ≥ 22（`node:sqlite` 实验特性）。覆盖 7 个 unit 断言 + 10 个 integration 断言，任一失败会非零退出。
 
 ## 使用
 
