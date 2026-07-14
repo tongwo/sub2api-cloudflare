@@ -1,0 +1,14 @@
+name = "sub2api-cf"
+main = "src/index.js"
+compatibility_date = "2025-06-01"
+compatibility_flags = ["nodejs_compat"]
+
+# D1 数据库绑定
+[[d1_databases]]
+binding = "DB"
+database_name = "sub2api-cf"
+database_id = "REPLACE_WITH_YOUR_D1_ID"
+
+# 密钥（不要用明文写在文件里，用 `wrangler secret put` 设置）：
+#   ADMIN_TOKEN  —— 管理后台 / 管理 API 的访问令牌
+# 设置命令见 README.md
