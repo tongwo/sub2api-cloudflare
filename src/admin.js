@@ -60,6 +60,33 @@ export const ADMIN_HTML = `<!doctype html>
   </div>
 
   <div class="card">
+    <h2>批量导入账号（Sub2API 格式）</h2>
+    <label>平台（用于 Codex 风格 content 导入）</label>
+    <select id="i_platform">
+      <option value="openai">OpenAI</option>
+      <option value="anthropic">Anthropic / Claude</option>
+      <option value="gemini">Google Gemini</option>
+      <option value="grok">xAI / Grok</option>
+      <option value="antigravity">Antigravity</option>
+    </select>
+    <label>导入内容（支持两种格式，任选其一）</label>
+    <textarea id="i_payload" style="height:160px" placeholder='格式A（简化数组）：
+[
+  {"name":"acc1","platform":"openai","type":"api_key","credentials":{"api_key":"sk-xxx"}},
+  {"name":"acc2","platform":"gemini","type":"oauth","credentials":{"access_token":"...","refresh_token":"...","expires_at":1735689600000}}
+]
+
+格式B（Sub2API Codex 风格）：
+{"content":"eyJ...","contents":["eyJ..."],"name":"batch","platform":"openai"}'></textarea>
+    <div class="row">
+      <label style="margin:0">或上传 JSON 文件</label>
+      <input id="i_file" type="file" accept=".json,application/json" style="width:auto">
+    </div>
+    <button onclick="importAccounts()">导入</button>
+    <pre id="i_out">—</pre>
+  </div>
+
+  <div class="card">
     <h2>生成用户 API Key</h2>
     <label>备注</label><input id="k_label" placeholder="例如：小明 / 团队A">
     <label>额度上限 tokens（可选，留空=不限）</label><input id="k_quota" placeholder="例如 1000000">
@@ -105,6 +132,31 @@ function addAccount(){
       model_map:$("a_map").value?JSON.parse($("a_map").value):{}})})
   .then(function(){$("a_name").value="";$("a_key").value="";$("a_base").value="";$("a_map").value="";loadAccounts();loadStats();})
   .catch(function(e){alert("添加失败："+e.message);});
+}
+function importAccounts(){
+  var raw = $("i_payload").value.trim();
+  if (!raw && $("i_file").files.length) {
+    var f = $("i_file").files[0];
+    var fr = new FileReader();
+    fr.onload = function(){ doImport(fr.result); };
+    fr.readAsText(f);
+    return;
+  }
+  doImport(raw);
+}
+function doImport(raw){
+  var payload;
+  try { payload = JSON.parse(raw); } catch(e){ alert("JSON 解析失败："+e.message); return; }
+  // 若是 Codex 风格对象，补 platform
+  if (payload && !Array.isArray(payload) && typeof payload === "object" && !payload.platform && payload.content) {
+    payload.platform = $("i_platform").value;
+  }
+  api("/admin/accounts/import",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(payload)})
+    .then(function(r){
+      $("i_out").textContent = JSON.stringify(r,null,2);
+      loadAccounts(); loadStats();
+    })
+    .catch(function(e){ $("i_out").textContent = "导入失败："+e.message; });
 }
 function addKey(){
   api("/admin/keys",{method:"POST",headers:{"content-type":"application/json"},

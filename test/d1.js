@@ -54,8 +54,9 @@ export function makeD1() {
     },
     // 从项目迁移文件建表
     migrate() {
-      const f = join(__dirname, "..", "migrations", "0001_init.sql");
-      db.exec(readFileSync(f, "utf8"));
+      for (const f of ["0001_init.sql", "0002_accounts_v2.sql"]) {
+        db.exec(readFileSync(join(__dirname, "..", "migrations", f), "utf8"));
+      }
     },
   };
 }

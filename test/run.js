@@ -97,6 +97,28 @@ function setup() {
   return { db, env, ctx };
 }
 async function seedAccount(db, acct) {
+  // 兼容新旧字段：新 v2 表优先
+  const existsV2 = await db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='accounts_v2'").first();
+  if (existsV2) {
+    const norm = {
+      name: acct.name,
+      platform: acct.provider || acct.platform,
+      type: acct.type || "api_key",
+      credentials: acct.credentials || { api_key: acct.api_key },
+      base_url: acct.base_url || DEFAULT_BASE[(acct.provider || acct.platform)],
+      model_map: acct.model_map || {},
+      priority: acct.priority ?? 50,
+    };
+    await db
+      .prepare(`INSERT INTO accounts_v2
+        (name,platform,type,credentials,extra,model_map,base_url,priority,concurrency,status,schedulable,expires_at,auto_pause_on_expired,usage_tokens,error_message,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .bind(norm.name, norm.platform, norm.type, JSON.stringify(norm.credentials), "{}",
+        JSON.stringify(norm.model_map), norm.base_url, norm.priority, 3, "active", 1,
+        acct.expires_at || null, 1, 0, null, Date.now())
+      .run();
+    return;
+  }
   await db
     .prepare(
       "INSERT INTO accounts (provider,name,api_key,base_url,model_map,weight,enabled,created_at) VALUES (?,?,?,?,?,?,?,?)"
@@ -104,6 +126,23 @@ async function seedAccount(db, acct) {
     .bind(acct.provider, acct.name, acct.api_key, acct.base_url || "", JSON.stringify(acct.model_map || {}), acct.weight || 1, 1, Date.now())
     .run();
 }
+
+// 直接插入 v2 账号（测试调度窗口用）
+async function seedAccountV2(db, acct) {
+  await db
+    .prepare(`INSERT INTO accounts_v2
+      (name,platform,type,credentials,extra,model_map,base_url,priority,concurrency,status,schedulable,rate_limit_reset_at,overload_until,temp_unschedulable_until,expires_at,auto_pause_on_expired,usage_tokens,error_message,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .bind(acct.name, acct.platform, acct.type || "api_key",
+      JSON.stringify(acct.credentials || { api_key: "k" }), "{}",
+      JSON.stringify(acct.model_map || {}), acct.base_url || DEFAULT_BASE[acct.platform],
+      acct.priority ?? 50, acct.concurrency ?? 3, acct.status ?? "active",
+      acct.schedulable ?? 1, acct.rate_limit_reset_at || null, acct.overload_until || null,
+      acct.temp_unschedulable_until || null, acct.expires_at || null, acct.auto_pause_on_expired ?? 1, 0, null, Date.now())
+    .run();
+}
+
+import { DEFAULT_BASE } from "../src/relay.js";
 async function seedKey(db, quota = null) {
   const key = "sk-" + crypto.randomUUID().replace(/-/g, "");
   await db
@@ -274,7 +313,7 @@ async function integrationTests(mock) {
     const { env, ctx } = setup();
     const H = { "x-admin-token": "test-admin-token", "content-type": "application/json" };
     const a = await worker.fetch(
-      new Request("https://x/admin/accounts", { method: "POST", headers: H, body: JSON.stringify({ name: "acc", provider: "openai", api_key: "sk-x" }) }),
+      new Request("https://x/admin/accounts", { method: "POST", headers: H, body: JSON.stringify({ name: "acc", platform: "openai", type: "api_key", credentials: { api_key: "sk-x" } }) }),
       env,
       ctx
     );
@@ -544,6 +583,173 @@ async function integrationTests(mock) {
     const third = await chat();
     assert(first && second && first !== second, "前两次选中不同账号");
     eq(first, third, "第三次回到第一个账号（LRU 循环）");
+  });
+
+  // ---------- 新增：导入 / 调度 / OAuth / cookie 拒绝 ----------
+
+  await test("双格式导入：简化数组批量建账号", async () => {
+    const { db, env, ctx } = setup();
+    const H = { "x-admin-token": "test-admin-token", "content-type": "application/json" };
+    const r = await worker.fetch(
+      new Request("https://x/admin/accounts/import", {
+        method: "POST", headers: H,
+        body: JSON.stringify([
+          { name: "oa1", platform: "openai", type: "api_key", credentials: { api_key: "sk-arr-1" } },
+          { name: "gm1", platform: "gemini", type: "api_key", credentials: { api_key: "key-g" } },
+        ]),
+      }),
+      env, ctx
+    );
+    const j = await r.json();
+    eq(j.total, 2, "total=2");
+    eq(j.created, 2, "created=2");
+    const list = await worker.fetch(new Request("https://x/admin/accounts", { headers: H }), env, ctx);
+    const rows = await list.json();
+    eq(rows.length, 2, "库里 2 个账号");
+  });
+
+  await test("导入去重：同名同平台重复导入 -> skipped/updated", async () => {
+    const { db, env, ctx } = setup();
+    const H = { "x-admin-token": "test-admin-token", "content-type": "application/json" };
+    const one = { name: "dup", platform: "openai", type: "api_key", credentials: { api_key: "sk-dup" } };
+    await worker.fetch(new Request("https://x/admin/accounts/import", { method: "POST", headers: H, body: JSON.stringify([one]) }), env, ctx);
+    const r2 = await worker.fetch(new Request("https://x/admin/accounts/import", { method: "POST", headers: H, body: JSON.stringify([one]) }), env, ctx);
+    const j2 = await r2.json();
+    eq(j2.updated + j2.skipped, 1, "第二次重复被 skipped 或 updated");
+  });
+
+  await test("cookie/sessionKey 类型导入被拒绝", async () => {
+    const { db, env, ctx } = setup();
+    const H = { "x-admin-token": "test-admin-token", "content-type": "application/json" };
+    const r = await worker.fetch(
+      new Request("https://x/admin/accounts/import", {
+        method: "POST", headers: H,
+        body: JSON.stringify([{ name: "ck", platform: "anthropic", type: "cookie", credentials: { session_key: "xxx" } }]),
+      }),
+      env, ctx
+    );
+    const j = await r.json();
+    eq(j.failed, 1, "failed=1");
+    assert(j.errors[0].message.includes("cookie"), "错误提示含 cookie");
+  });
+
+  await test("Sub2API 调度：rate_limit_reset_at 未来的账号被跳过", async () => {
+    const { db, env, ctx } = setup();
+    await seedAccountV2(db, { name: "blocked", platform: "openai", credentials: { api_key: "sk-x" }, rate_limit_reset_at: Date.now() + 60000 });
+    await seedAccountV2(db, { name: "ok", platform: "openai", credentials: { api_key: "sk-y" } });
+    const key = await seedKey(db);
+    mock.calls.length = 0;
+    const r = await worker.fetch(
+      new Request("https://x/v1/chat/completions", {
+        method: "POST", headers: { authorization: "Bearer " + key, "content-type": "application/json" },
+        body: JSON.stringify({ model: "gpt-4o", messages: [{ role: "user", content: "hi" }] }),
+      }), env, ctx
+    );
+    await r.json();
+    await ctx.drain();
+    const auths = mock.calls.filter((c) => c.host === "api.openai.com").map((c) => c.headers.authorization);
+    eq(auths[0], "Bearer sk-y", "选中未限速的账号");
+  });
+
+  await test("Sub2API 调度：priority 小的优先", async () => {
+    const { db, env, ctx } = setup();
+    await seedAccountV2(db, { name: "low", platform: "openai", credentials: { api_key: "sk-low" }, priority: 80 });
+    await seedAccountV2(db, { name: "high", platform: "openai", credentials: { api_key: "sk-high" }, priority: 10 });
+    const key = await seedKey(db);
+    mock.calls.length = 0;
+    const r = await worker.fetch(
+      new Request("https://x/v1/chat/completions", {
+        method: "POST", headers: { authorization: "Bearer " + key, "content-type": "application/json" },
+        body: JSON.stringify({ model: "gpt-4o", messages: [{ role: "user", content: "hi" }] }),
+      }), env, ctx
+    );
+    await r.json();
+    await ctx.drain();
+    const auths = mock.calls.filter((c) => c.host === "api.openai.com").map((c) => c.headers.authorization);
+    eq(auths[0], "Bearer sk-high", "priority 小的先选");
+  });
+
+  await test("OAuth 账号：即将过期时自动刷新（mock fetch 命中 refresh 端点）", async () => {
+    // 装一个能识别 refresh 端点的 fetch mock
+    const orig = globalThis.fetch;
+    globalThis.fetch = async (url, opts = {}) => {
+      const u = new URL(typeof url === "string" ? url : url.toString());
+      if (u.host === "auth.openai.com" && u.pathname.includes("/oauth/token")) {
+        return new Response(JSON.stringify({ access_token: "new-at", refresh_token: "new-rt", expires_in: 3600 }), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }
+      return orig(url, opts);
+    };
+    const { db, env, ctx } = setup();
+    await seedAccountV2(db, {
+      name: "oa-oauth", platform: "openai", type: "oauth",
+      credentials: { access_token: "old-at", refresh_token: "old-rt", expires_at: Date.now() - 1000 },
+    });
+    const key = await seedKey(db);
+    const r = await worker.fetch(
+      new Request("https://x/v1/chat/completions", {
+        method: "POST", headers: { authorization: "Bearer " + key, "content-type": "application/json" },
+        body: JSON.stringify({ model: "gpt-4o", messages: [{ role: "user", content: "hi" }] }),
+      }), env, ctx
+    );
+    await r.json();
+    await ctx.drain();
+    const row = await db.prepare("SELECT credentials FROM accounts_v2 WHERE name=?").bind("oa-oauth").first();
+    const cred = JSON.parse(row.credentials);
+    eq(cred.access_token, "new-at", "OAuth token 已刷新");
+    globalThis.fetch = orig;
+  });
+
+  await test("Grok 平台：OAuth 走 OpenAI 兼容协议", async () => {
+    const { db, env, ctx } = setup();
+    await seedAccountV2(db, { name: "grok1", platform: "grok", type: "api_key", credentials: { api_key: "sk-grok" } });
+    const key = await seedKey(db);
+    mock.calls.length = 0;
+    const r = await worker.fetch(
+      new Request("https://x/v1/chat/completions", {
+        method: "POST", headers: { authorization: "Bearer " + key, "content-type": "application/json" },
+        body: JSON.stringify({ model: "grok-3", messages: [{ role: "user", content: "hi" }] }),
+      }), env, ctx
+    );
+    await r.json();
+    await ctx.drain();
+    const grokCalls = mock.calls.filter((c) => c.host === "api.x.ai");
+    eq(grokCalls.length, 1, "请求发到 api.x.ai");
+    eq(grokCalls[0].headers.authorization, "Bearer sk-grok", "带 Bearer key");
+  });
+
+  await test("真实 Sub2API 备份导出格式 {accounts:[...],expires_at秒} 可导入", async () => {
+    const { db, env, ctx } = setup();
+    const H = { "x-admin-token": "test-admin-token", "content-type": "application/json" };
+    // 复刻 Sub2API ExportData 真实结构（外层 accounts、unix 秒 expires_at）
+    const exportPayload = {
+      version: 1,
+      exported_at: "2026-07-18T08:14:00Z",
+      accounts: [
+        { name: "real-oa", notes: "备份", platform: "openai", type: "api_key",
+          credentials: { api_key: "sk-real-1" }, concurrency: 3, priority: 50,
+          rate_multiplier: 1.0, expires_at: 1999999999, auto_pause_on_expired: true },
+        { name: "real-oauth", notes: "oauth备份", platform: "openai", type: "oauth",
+          credentials: { access_token: "at", refresh_token: "rt", expires_at: 1999999999 },
+          concurrency: 5, priority: 20 },
+      ],
+    };
+    const r = await worker.fetch(
+      new Request("https://x/admin/accounts/import", { method: "POST", headers: H, body: JSON.stringify(exportPayload) }),
+      env, ctx
+    );
+    const j = await r.json();
+    eq(j.total, 2, "total=2");
+    eq(j.created, 2, "created=2");
+    const row = await db.prepare("SELECT credentials, extra, priority FROM accounts_v2 WHERE name=?").bind("real-oa").first();
+    const cred = JSON.parse(row.credentials);
+    eq(cred.api_key, "sk-real-1", "api_key 正确导入");
+    eq(row.priority, 50, "priority 导入");
+    // 验证 expires_at 秒已被转成毫秒
+    const oauthRow = await db.prepare("SELECT credentials FROM accounts_v2 WHERE name=?").bind("real-oauth").first();
+    const ocred = JSON.parse(oauthRow.credentials);
+    eq(ocred.expires_at, 1999999999000, "expires_at 秒->毫秒转换");
   });
 }
 

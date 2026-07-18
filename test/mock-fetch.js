@@ -24,6 +24,7 @@ export function installFetchMock() {
     if (u.host === "api.openai.com") return mockOpenAI(body);
     if (u.host === "api.anthropic.com") return mockAnthropic(body);
     if (u.host === "generativelanguage.googleapis.com") return mockGemini(body, u);
+    if (u.host === "api.x.ai") return mockOpenAI(body); // Grok 走 OpenAI 兼容协议
     return new Response("not found", { status: 404 });
   };
 

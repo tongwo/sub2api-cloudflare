@@ -1,15 +1,55 @@
-// relay.js — 上游供应商协议适配层
-// 目标：把统一的 OpenAI 格式请求，转成各家上游格式；
-//        把各家上游响应（含 SSE 流式）转回 OpenAI 格式。
+// relay.js — 上游供应商协议适配层（Sub2API-CF v2）
+// 支持 platform: openai | anthropic | gemini | grok | antigravity
+// 支持 type:     api_key | oauth
+//   - api_key:   credentials = { api_key }
+//   - oauth:     credentials = { access_token, refresh_token?, expires_at?, client_id? }
+// cookie 类型由导入层拒绝，这里不实现。
+//
+// 目标：把统一的 OpenAI 格式请求，转成各家上游格式；把各家上游响应（含 SSE）转回 OpenAI 格式。
 
 export const DEFAULT_BASE = {
-  openai:   "https://api.openai.com/v1",
-  anthropic: "https://api.anthropic.com",
-  gemini:   "https://generativelanguage.googleapis.com",
+  openai:     "https://api.openai.com/v1",
+  anthropic:  "https://api.anthropic.com",
+  gemini:     "https://generativelanguage.googleapis.com",
+  grok:       "https://api.x.ai/v1",
+  antigravity:"https://api.anthropic.com", // antigravity 复用 Anthropic 协议（Claude 侧）
 };
+
+// OAuth 刷新端点（已核实）
+export const OAUTH_TOKEN_URL = {
+  openai:   "https://auth.openai.com/oauth/token",
+  gemini:   "https://oauth2.googleapis.com/token",
+  grok:     "https://auth.x.ai/oauth2/token",
+  // anthropic/antigravity OAuth 走 sessionKey（cookie），本实现不支持
+};
+
+const SUPPORTED_PLATFORMS = Object.keys(DEFAULT_BASE);
 
 function safeJson(s, fallback) {
   try { return JSON.parse(s); } catch { return fallback; }
+}
+function safeCred(acct) {
+  return safeJson(acct.credentials, {});
+}
+
+// 取当前可用的访问令牌：
+// - api_key 类型：返回 { kind:"apikey", token }
+// - oauth 类型：返回 { kind:"oauth", token, refresh_token, expires_at, client_id }
+function credentialFor(acct) {
+  const c = safeJson(acct.credentials, {});
+  // 兼容旧顶层 api_key 字段
+  if (!c.api_key && acct.api_key) c.api_key = acct.api_key;
+  if (acct.type === "oauth") {
+    return {
+      kind: "oauth",
+      token: c.access_token || "",
+      refresh_token: c.refresh_token || "",
+      expires_at: c.expires_at || 0,
+      client_id: c.client_id || "",
+    };
+  }
+  // 默认按 api_key
+  return { kind: "apikey", token: c.api_key || "" };
 }
 
 // 把 system 消息从 messages 中拆出来（Anthropic / Gemini 需要单独字段）
@@ -31,37 +71,45 @@ function mapFinish(reason) {
   return m[reason] || "stop";
 }
 
-// 把账号 + 用户请求，构建成访问上游所需的 {url, headers, body, ...}
-// 返回字段：
-//   provider      上游类型
-//   isStream      是否流式
-//   translateResponse(json) -> json   （非流式响应转换，可选）
-//   translator     （流式转换对象，见下方 makeOpenAIStream 用的 translator）
+// 主入口：构建访问上游所需的 {url, headers, body, isStream, translator, provider}
+// 返回的对象带 `credential` 信息，供 index.js 决定是否刷新。
 export function buildUpstream(acct, body) {
   const map = safeJson(acct.model_map, {});
   const model = map[body.model] || body.model;
   const isStream = !!body.stream;
-  const base = (acct.base_url && acct.base_url.trim()) || DEFAULT_BASE[acct.provider];
+  // 兼容旧字段 provider 与新字段 platform
+  const platform = acct.platform || acct.provider;
+  const base = (acct.base_url && acct.base_url.trim()) || DEFAULT_BASE[platform];
+  const cred = credentialFor({ ...acct, platform });
 
-  if (acct.provider === "openai") {
+  if (!SUPPORTED_PLATFORMS.includes(platform)) {
+    throw new Error(`unsupported platform: ${platform}`);
+  }
+
+  // ---------- OpenAI 兼容（openai / grok / antigravity 走 OpenAI 协议） ----------
+  if (platform === "openai" || platform === "grok") {
     const out = { ...body, model, stream: isStream };
-    // 流式时自动要求上游回传 usage（与客户端已传的 stream_options 合并，不覆盖）
     if (isStream) {
       out.stream_options = { ...(body.stream_options || {}), include_usage: true };
     }
+    const headers = { "content-type": "application/json", authorization: `Bearer ${cred.token}` };
+    if (platform === "grok" && cred.kind === "oauth") {
+      // Grok OAuth 需要区分头，保持 Bearer 即可
+    }
     return {
-      provider: "openai",
+      provider: platform,
       isStream,
+      credential: cred,
       url: `${base}/chat/completions`,
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${acct.api_key}`,
-      },
+      headers,
       body: JSON.stringify(out),
+      translateResponse: (j) => j,
+      translator: openaiPassTranslator,
     };
   }
 
-  if (acct.provider === "anthropic") {
+  // ---------- Anthropic / Antigravity（Claude 协议） ----------
+  if (platform === "anthropic" || platform === "antigravity") {
     const { system, rest } = splitSystem(body.messages || []);
     const payload = {
       model,
@@ -73,39 +121,83 @@ export function buildUpstream(acct, body) {
       ...(body.top_p != null ? { top_p: body.top_p } : {}),
       ...(body.stop ? { stop_sequences: Array.isArray(body.stop) ? body.stop : [body.stop] } : {}),
     };
+    const headers = {
+      "content-type": "application/json",
+      "x-api-key": cred.token,
+      "anthropic-version": "2023-06-01",
+    };
     return {
-      provider: "anthropic",
+      provider: platform,
       isStream,
+      credential: cred,
       url: `${base}/v1/messages`,
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": acct.api_key,
-        "anthropic-version": "2023-06-01",
-      },
+      headers,
       body: JSON.stringify(payload),
       translateResponse: (j) => anthropicToOpenAI(j, model),
       translator: anthropicTranslator,
     };
   }
 
-  if (acct.provider === "gemini") {
+  // ---------- Gemini ----------
+  if (platform === "gemini") {
     const payload = openAIToGemini(body, model);
     const q = isStream ? "?alt=sse" : "";
+    const headers = { "content-type": "application/json" };
+    if (cred.kind === "oauth") headers.authorization = `Bearer ${cred.token}`;
+    else headers["x-goog-api-key"] = cred.token;
     return {
       provider: "gemini",
       isStream,
+      credential: cred,
       url: `${base}/v1beta/models/${model}:streamGenerateContent${q}`,
-      headers: {
-        "content-type": "application/json",
-        "x-goog-api-key": acct.api_key,
-      },
+      headers,
       body: JSON.stringify(payload),
       translateResponse: (j) => geminiToOpenAI(j, model),
       translator: geminiTranslator,
     };
   }
 
-  throw new Error(`unsupported provider: ${acct.provider}`);
+  throw new Error(`unsupported platform: ${platform}`);
+}
+
+// 判断 oauth credential 是否需在发送前刷新（提前 5 分钟窗口）
+export function needsOAuthRefresh(cred) {
+  if (cred.kind !== "oauth") return false;
+  if (!cred.refresh_token) return false;
+  if (!cred.expires_at) return false;
+  const now = Date.now();
+  const window = 5 * 60 * 1000;
+  return cred.expires_at - now < window;
+}
+
+// 同步刷新 OAuth token（返回新的 credentials 子集）
+export async function refreshOAuth(platform, cred, env) {
+  const url = OAUTH_TOKEN_URL[platform];
+  if (!url) throw new Error(`no oauth endpoint for platform: ${platform}`);
+  const params = new URLSearchParams();
+  params.set("grant_type", "refresh_token");
+  params.set("refresh_token", cred.refresh_token);
+  if (cred.client_id) params.set("client_id", cred.client_id);
+  // Gemini 需要 client_secret；从 secret 读取（可选）
+  if (platform === "gemini" && env && env.GEMINI_OAUTH_CLIENT_SECRET) {
+    params.set("client_secret", env.GEMINI_OAUTH_CLIENT_SECRET);
+  }
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: params.toString(),
+  });
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => "");
+    throw new Error(`oauth refresh failed (${resp.status}): ${txt.slice(0, 200)}`);
+  }
+  const j = await resp.json();
+  const expires_at = j.expires_in ? Date.now() + j.expires_in * 1000 : cred.expires_at;
+  return {
+    access_token: j.access_token,
+    refresh_token: j.refresh_token || cred.refresh_token,
+    expires_at,
+  };
 }
 
 // ---------- OpenAI 格式 -> 各家 ----------
@@ -172,15 +264,12 @@ export function geminiToOpenAI(j, model) {
 }
 
 // ---------- 流式转换器（SSE -> OpenAI SSE） ----------
-// 每个 translator 暴露 onData(data, state) 与可选的 flush(state)，
-// 返回要下发的 OpenAI chunk 数组（已是对象，由调用方序列化）。
-// state 在整次流式过程中共享，用于累积 usage。
 
 export const openaiPassTranslator = {
   onData(data, state) {
     let j; try { j = JSON.parse(data); } catch { return null; }
     if (j && j.usage) state.usage = j.usage;
-    return [j]; // 原样透传 OpenAI 的 data 行
+    return [j];
   },
   flush() { return []; },
 };
@@ -259,19 +348,16 @@ const geminiTranslator = {
 };
 
 // 把上游的 SSE 流，按 translator 转成 OpenAI SSE 流。
-// onDone(state) 在流结束时异步调用（用于落库用量）。
 export function makeOpenAIStream(upstreamBody, translator, state, onDone) {
   const reader = upstreamBody.getReader();
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
   let buf = "";
 
-  // 处理 buf 中的完整行。isFinal=false 时把可能不完整的末行留在 buf；
-  // isFinal=true（流结束）时把最后一行也一并处理，避免末尾事件丢失。
   function consume(controller, isFinal) {
     if (!buf) return;
     const lines = buf.split("\n");
-    if (!isFinal) buf = lines.pop() || ""; // 残行留到下次 / 收尾
+    if (!isFinal) buf = lines.pop() || "";
     for (const raw of lines) {
       const line = raw.trim();
       if (!line) continue;

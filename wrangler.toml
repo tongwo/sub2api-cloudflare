@@ -14,6 +14,11 @@ database_id = "17c11d10-079d-4912-a2ca-de6c932a7dfc"
 pattern = "api.kailongliu0324.qzz.io"
 custom_domain = true
 
+# Cron：每 10 分钟刷新临近过期的 OAuth token
+[triggers]
+crons = ["*/10 * * * *"]
+
 # 密钥（不要用明文写在文件里，用 `wrangler secret put` 设置）：
 #   ADMIN_TOKEN  —— 管理后台 / 管理 API 的访问令牌
+#   GEMINI_OAUTH_CLIENT_SECRET —— 可选，Gemini OAuth 刷新需要
 # 设置命令见 README.md
